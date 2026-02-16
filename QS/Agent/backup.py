@@ -1,0 +1,2595 @@
+"""
+TripleG-Sam GUI Application
+A modern cyberpunk-themed GUI wrapper for the TripleG-Sam AI agent.
+Uses customtkinter for a sleek dark interface.
+Integrates the Skills Marketplace for downloading and managing agent skills.
+Features: File Explorer, Copy Messages, Skills Marketplace
+"""
+
+import os
+import sys
+import subprocess
+import threading
+import queue
+import time
+import re
+import json
+import ast
+import math
+import random
+from datetime import datetime
+from typing import Optional, Callable, List, Dict, Any, Tuple
+from pathlib import Path
+
+import numpy as np
+
+# Import customtkinter for modern themed widgets
+try:
+    import customtkinter as ctk
+    from customtkinter import CTk, CTkFrame, CTkLabel, CTkButton, CTkTextbox, CTkEntry
+    from customtkinter import CTkScrollableFrame, CTkOptionMenu, CTkSwitch, CTkProgressBar
+    from customtkinter import CTkTabview, CTkToplevel
+except ImportError:
+    print("ERROR: customtkinter not installed!")
+    print("Install with: pip install customtkinter")
+    sys.exit(1)
+
+# Import tkinter extras
+import tkinter as tk
+from tkinter import messagebox, filedialog, ttk
+
+# Import backend from tripleg.py
+try:
+    from tripleg import (
+        CONFIG, console, client,
+        ToolEngine, SkillManager, SamsLawConversationManager, ResponseParser,
+        TORCH_AVAILABLE, YAML_AVAILABLE, BUILTIN_SKILLS,
+        Skill, SkillCategory
+    )
+    from openai import APIError, APITimeoutError
+except ImportError as e:
+    print(f"ERROR: Could not import from tripleg.py: {e}")
+    print("Make sure tripleg.py is in the same directory.")
+    sys.exit(1)
+
+# Import voice module
+VOICE_AVAILABLE = False
+try:
+    from voice_module import (
+        VoiceManager, VoiceConfig, VoiceState,
+        check_dependencies as check_voice_deps,
+        get_install_command as get_voice_install_cmd,
+        WHISPER_AVAILABLE as VOICE_WHISPER_OK,
+        SOUNDDEVICE_AVAILABLE as VOICE_SD_OK,
+        EDGE_TTS_AVAILABLE as VOICE_TTS_OK,
+        PYGAME_AVAILABLE as VOICE_PG_OK,
+    )
+    VOICE_AVAILABLE = True
+except ImportError as e:
+    print(f"WARNING: Voice module not available: {e}")
+    VoiceManager = None  # type: ignore[assignment,misc]
+    VoiceConfig = None  # type: ignore[assignment,misc]
+    VoiceState = None  # type: ignore[assignment,misc]
+
+# Import marketplace
+try:
+    from skills_marketplace import SkillsMarketplaceEngine, MarketplaceSkill, SKILL_SOURCES
+except ImportError as e:
+    print(f"WARNING: Could not import skills_marketplace.py: {e}")
+    SkillsMarketplaceEngine = None
+
+# ==========================================
+# CYBERPUNK THEME CONFIGURATION
+# ==========================================
+
+THEME = {
+    "bg_dark": "#0a0a0f",
+    "bg_medium": "#12121a",
+    "bg_light": "#1a1a2e",
+    "bg_card": "#16162a",
+    "accent_magenta": "#ff00ff",
+    "accent_cyan": "#00ffff",
+    "accent_purple": "#9d4edd",
+    "accent_blue": "#4488ff",
+    "text_primary": "#ffffff",
+    "text_secondary": "#a0a0a0",
+    "text_dim": "#606060",
+    "user_bubble": "#1e3a5f",
+    "assistant_bubble": "#2d1b4e",
+    "tool_bubble": "#1a3a1a",
+    "error_color": "#ff4444",
+    "success_color": "#44ff44",
+    "warning_color": "#ffaa00",
+    "official_color": "#44aaff",
+    "community_color": "#aa44ff",
+    "specialized_color": "#ff8844",
+    "custom_color": "#44ffaa",
+}
+
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("blue")
+
+
+# ==========================================
+# CHAT MESSAGE WIDGET
+# ==========================================
+
+class ChatMessage(CTkFrame):
+    """A single chat message bubble with copy support."""
+
+    def __init__(self, parent, role: str, content: str, timestamp: str = "", **kwargs):
+        super().__init__(parent, **kwargs)
+        self._content = content
+
+        if role == "user":
+            bg_color = THEME["user_bubble"]
+            label_text = "You"
+            label_color = THEME["accent_cyan"]
+        elif role == "assistant":
+            bg_color = THEME["assistant_bubble"]
+            label_text = "TripleG-Sam"
+            label_color = THEME["accent_magenta"]
+        elif role == "tool":
+            bg_color = THEME["tool_bubble"]
+            label_text = "Tool"
+            label_color = THEME["warning_color"]
+        elif role == "system":
+            bg_color = THEME["bg_light"]
+            label_text = "System"
+            label_color = THEME["text_dim"]
+        else:
+            bg_color = THEME["bg_medium"]
+            label_text = role.title()
+            label_color = THEME["text_secondary"]
+
+        self.configure(fg_color=bg_color, corner_radius=10)
+
+        header_frame = CTkFrame(self, fg_color="transparent")
+        header_frame.pack(fill="x", padx=10, pady=(8, 2))
+
+        role_label = CTkLabel(
+            header_frame,
+            text=label_text,
+            font=("Consolas", 11, "bold"),
+            text_color=label_color
+        )
+        role_label.pack(side="left")
+
+        # Copy button
+        self._copy_btn = CTkButton(
+            header_frame,
+            text="📋",
+            width=28, height=20,
+            font=("Consolas", 10),
+            fg_color="transparent",
+            hover_color=THEME["bg_light"],
+            text_color=THEME["text_dim"],
+            command=self._copy_to_clipboard
+        )
+        self._copy_btn.pack(side="right", padx=(4, 0))
+
+        if timestamp:
+            time_label = CTkLabel(
+                header_frame,
+                text=timestamp,
+                font=("Consolas", 9),
+                text_color=THEME["text_dim"]
+            )
+            time_label.pack(side="right")
+
+        content_label = CTkLabel(
+            self,
+            text=content,
+            font=("Consolas", 12),
+            text_color=THEME["text_primary"],
+            wraplength=500,
+            justify="left",
+            anchor="w"
+        )
+        content_label.pack(fill="x", padx=10, pady=(2, 10))
+
+        # Right-click context menu
+        self._ctx_menu = tk.Menu(self, tearoff=0, bg=THEME["bg_light"],
+                                  fg=THEME["text_primary"], activebackground=THEME["accent_purple"],
+                                  activeforeground="#ffffff", font=("Consolas", 10))
+        self._ctx_menu.add_command(label="Copy Message", command=self._copy_to_clipboard)
+        self._ctx_menu.add_command(label="Copy as Code Block", command=self._copy_as_code)
+
+        # Bind right-click to self and all children
+        self.bind("<Button-3>", self._show_ctx_menu)
+        content_label.bind("<Button-3>", self._show_ctx_menu)
+        header_frame.bind("<Button-3>", self._show_ctx_menu)
+        role_label.bind("<Button-3>", self._show_ctx_menu)
+
+    def _copy_to_clipboard(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._content)
+        # Flash the copy button to confirm
+        self._copy_btn.configure(text="✓", text_color=THEME["success_color"])
+        self.after(1000, lambda: self._copy_btn.configure(text="📋", text_color=THEME["text_dim"]))
+
+    def _copy_as_code(self):
+        self.clipboard_clear()
+        self.clipboard_append(f"```\n{self._content}\n```")
+        self._copy_btn.configure(text="✓", text_color=THEME["success_color"])
+        self.after(1000, lambda: self._copy_btn.configure(text="📋", text_color=THEME["text_dim"]))
+
+    def _show_ctx_menu(self, event):
+        try:
+            self._ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx_menu.grab_release()
+
+
+# ==========================================
+# FILE EXPLORER PANEL
+# ==========================================
+
+# File extension to icon/color mapping
+FILE_ICONS = {
+    ".py": ("🐍", "#3572A5"),
+    ".js": ("📜", "#f1e05a"),
+    ".ts": ("📘", "#2b7489"),
+    ".html": ("🌐", "#e34c26"),
+    ".css": ("🎨", "#563d7c"),
+    ".json": ("📋", "#40d47e"),
+    ".md": ("📝", "#083fa1"),
+    ".txt": ("📄", "#a0a0a0"),
+    ".yaml": ("⚙️", "#cb171e"),
+    ".yml": ("⚙️", "#cb171e"),
+    ".toml": ("⚙️", "#9c4221"),
+    ".cfg": ("⚙️", "#9c4221"),
+    ".ini": ("⚙️", "#9c4221"),
+    ".sh": ("🖥️", "#89e051"),
+    ".bat": ("🖥️", "#C1F12E"),
+    ".ps1": ("🖥️", "#012456"),
+    ".cpp": ("⚡", "#f34b7d"),
+    ".c": ("⚡", "#555555"),
+    ".h": ("⚡", "#a0a0a0"),
+    ".java": ("☕", "#b07219"),
+    ".rs": ("🦀", "#dea584"),
+    ".go": ("🐹", "#00ADD8"),
+    ".rb": ("💎", "#701516"),
+    ".php": ("🐘", "#4F5D95"),
+    ".sql": ("🗃️", "#e38c00"),
+    ".xml": ("📰", "#0060ac"),
+    ".svg": ("🖼️", "#ff9900"),
+    ".png": ("🖼️", "#a0a0a0"),
+    ".jpg": ("🖼️", "#a0a0a0"),
+    ".gif": ("🖼️", "#a0a0a0"),
+    ".ico": ("🖼️", "#a0a0a0"),
+    ".zip": ("📦", "#a0a0a0"),
+    ".gz": ("📦", "#a0a0a0"),
+    ".tar": ("📦", "#a0a0a0"),
+    ".exe": ("⚙️", "#a0a0a0"),
+    ".dll": ("⚙️", "#a0a0a0"),
+    ".gitignore": ("🚫", "#f05032"),
+    ".env": ("🔒", "#ecd53f"),
+    ".log": ("📊", "#a0a0a0"),
+}
+
+
+class FileViewerPopup(CTkToplevel):
+    """Popup window for viewing file contents."""
+
+    def __init__(self, parent, filepath: str, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.filepath = filepath
+        fname = os.path.basename(filepath)
+        self.title(f"File: {fname}")
+        self.geometry("700x550")
+        self.configure(fg_color=THEME["bg_dark"])
+        self.transient(parent)
+
+        # Header
+        header = CTkFrame(self, fg_color=THEME["bg_medium"], corner_radius=8)
+        header.pack(fill="x", padx=8, pady=(8, 4))
+
+        ext = os.path.splitext(fname)[1].lower()
+        icon, color = FILE_ICONS.get(ext, ("📄", THEME["text_dim"]))
+
+        CTkLabel(header, text=f"{icon} {fname}", font=("Consolas", 14, "bold"),
+                 text_color=color).pack(side="left", padx=10, pady=6)
+
+        # Path label
+        CTkLabel(header, text=filepath, font=("Consolas", 9),
+                 text_color=THEME["text_dim"]).pack(side="right", padx=10, pady=6)
+
+        # Button row
+        btn_row = CTkFrame(self, fg_color="transparent")
+        btn_row.pack(fill="x", padx=8, pady=4)
+
+        CTkButton(btn_row, text="📋 Copy All", width=90, height=26,
+                  font=("Consolas", 9), fg_color=THEME["accent_purple"],
+                  hover_color=THEME["accent_magenta"],
+                  command=self._copy_all).pack(side="left", padx=3)
+
+        CTkButton(btn_row, text="📋 Copy Path", width=90, height=26,
+                  font=("Consolas", 9), fg_color=THEME["bg_light"],
+                  hover_color=THEME["accent_blue"],
+                  command=self._copy_path).pack(side="left", padx=3)
+
+        # File size label
+        try:
+            size = os.path.getsize(filepath)
+            if size < 1024:
+                size_str = f"{size} B"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.1f} KB"
+            else:
+                size_str = f"{size / (1024 * 1024):.1f} MB"
+        except OSError:
+            size_str = "?"
+        CTkLabel(btn_row, text=size_str, font=("Consolas", 9),
+                 text_color=THEME["text_dim"]).pack(side="right", padx=10)
+
+        # Content textbox
+        self.content_box = CTkTextbox(
+            self, font=("Consolas", 11),
+            fg_color=THEME["bg_light"],
+            text_color=THEME["text_primary"],
+            wrap="none"
+        )
+        self.content_box.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+
+        # Load content
+        self._load_file()
+
+        # Close button
+        CTkButton(self, text="Close", command=self.destroy, width=80, height=28,
+                  fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+                  font=("Consolas", 10)).pack(pady=(0, 8))
+
+    def _load_file(self):
+        try:
+            # Check file size - don't load huge files
+            size = os.path.getsize(self.filepath)
+            if size > 2 * 1024 * 1024:  # 2MB limit
+                self.content_box.insert("1.0", f"[File too large to display: {size / (1024*1024):.1f} MB]")
+                self.content_box.configure(state="disabled")
+                return
+
+            # Try reading as text
+            with open(self.filepath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            self.content_box.insert("1.0", content)
+            self.content_box.configure(state="disabled")
+        except Exception as e:
+            self.content_box.insert("1.0", f"[Error reading file: {e}]")
+            self.content_box.configure(state="disabled")
+
+    def _copy_all(self):
+        content = self.content_box.get("1.0", "end").strip()
+        self.clipboard_clear()
+        self.clipboard_append(content)
+
+    def _copy_path(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.filepath)
+
+
+class FileExplorer(CTkFrame):
+    """VS Code-style file explorer panel with tree view."""
+
+    # Folders/files to hide
+    HIDDEN_PATTERNS = {
+        "__pycache__", ".git", ".venv", "venv", "node_modules",
+        ".mypy_cache", ".pytest_cache", ".tox", "dist", "build",
+        "*.pyc", "*.pyo", ".DS_Store", "Thumbs.db", ".env",
+    }
+
+    def __init__(self, parent, chat_input_callback=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.configure(fg_color=THEME["bg_medium"])
+        self.chat_input_callback = chat_input_callback
+        self.current_root = os.path.expanduser("~")
+
+
+        # Title bar
+        title_frame = CTkFrame(self, fg_color="transparent")
+        title_frame.pack(fill="x", padx=4, pady=(4, 0))
+
+        CTkLabel(title_frame, text="📁 EXPLORER",
+                 font=("Consolas", 11, "bold"),
+                 text_color=THEME["accent_cyan"]).pack(side="left", padx=4)
+
+        CTkButton(title_frame, text="⟳", width=24, height=22,
+                  font=("Consolas", 11), fg_color="transparent",
+                  hover_color=THEME["bg_light"], text_color=THEME["text_dim"],
+                  command=self._refresh_tree).pack(side="right", padx=2)
+
+        CTkButton(title_frame, text="📂", width=24, height=22,
+                  font=("Consolas", 11), fg_color="transparent",
+                  hover_color=THEME["bg_light"], text_color=THEME["text_dim"],
+                  command=self._open_folder).pack(side="right", padx=2)
+
+        # Current folder label
+        self.folder_label = CTkLabel(
+            self, text=self._short_path(self.current_root),
+            font=("Consolas", 9), text_color=THEME["text_dim"],
+            anchor="w"
+        )
+        self.folder_label.pack(fill="x", padx=8, pady=(2, 4))
+
+        # Style the ttk Treeview to match cyberpunk theme
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure("Cyber.Treeview",
+                         background=THEME["bg_dark"],
+                         foreground=THEME["text_primary"],
+                         fieldbackground=THEME["bg_dark"],
+                         borderwidth=0,
+                         font=("Consolas", 10),
+                         rowheight=22)
+        style.configure("Cyber.Treeview.Heading",
+                         background=THEME["bg_medium"],
+                         foreground=THEME["accent_cyan"],
+                         font=("Consolas", 9, "bold"),
+                         borderwidth=0)
+        style.map("Cyber.Treeview",
+                   background=[("selected", THEME["accent_purple"])],
+                   foreground=[("selected", "#ffffff")])
+
+        # Tree container
+        tree_frame = CTkFrame(self, fg_color=THEME["bg_dark"], corner_radius=6)
+        tree_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+
+        # Treeview widget
+        self.tree = ttk.Treeview(tree_frame, style="Cyber.Treeview",
+                                  show="tree", selectmode="browse")
+        self.tree.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # Scrollbar
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+
+        # Bindings
+        self.tree.bind("<Double-1>", self._on_double_click)
+        self.tree.bind("<<TreeviewOpen>>", self._on_expand)
+
+        # Right-click context menu
+        self._ctx_menu = tk.Menu(self, tearoff=0, bg=THEME["bg_light"],
+                                  fg=THEME["text_primary"],
+                                  activebackground=THEME["accent_purple"],
+                                  activeforeground="#ffffff",
+                                  font=("Consolas", 10))
+        self._ctx_menu.add_command(label="📋 Copy Path", command=self._copy_selected_path)
+        self._ctx_menu.add_command(label="💬 Send to Chat", command=self._send_to_chat)
+        self._ctx_menu.add_separator()
+        self._ctx_menu.add_command(label="👁️ View File", command=self._view_selected)
+        self._ctx_menu.add_command(label="📂 Open in Explorer", command=self._open_in_system)
+        self.tree.bind("<Button-3>", self._show_ctx_menu)
+
+        # Action buttons
+        btn_frame = CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=4, pady=(0, 4))
+
+        CTkButton(btn_frame, text="💬 Send Path", height=24,
+                  font=("Consolas", 9), fg_color=THEME["accent_purple"],
+                  hover_color=THEME["accent_magenta"],
+                  command=self._send_to_chat).pack(side="left", fill="x", expand=True, padx=2)
+
+        CTkButton(btn_frame, text="👁️ View", height=24,
+                  font=("Consolas", 9), fg_color=THEME["bg_light"],
+                  hover_color=THEME["accent_blue"],
+                  command=self._view_selected).pack(side="left", fill="x", expand=True, padx=2)
+
+        # Populate tree
+        self._populate_root()
+
+    def _short_path(self, path: str, max_len: int = 30) -> str:
+        if len(path) <= max_len:
+            return path
+        parts = Path(path).parts
+        if len(parts) <= 2:
+            return path
+        return str(Path(parts[0]) / "..." / parts[-1])
+
+    def _should_hide(self, name: str) -> bool:
+        if name.startswith(".") and name not in (".env",):
+            return True
+        for pattern in self.HIDDEN_PATTERNS:
+            if pattern.startswith("*"):
+                if name.endswith(pattern[1:]):
+                    return True
+            elif name == pattern:
+                return True
+        return False
+
+    def _open_folder(self):
+        folder = filedialog.askdirectory(
+            title="Open Project Folder",
+            initialdir=self.current_root
+        )
+        if folder:
+            self.current_root = folder
+            self.folder_label.configure(text=self._short_path(folder))
+            self._populate_root()
+
+    def _refresh_tree(self):
+        self._populate_root()
+
+    def _populate_root(self):
+        # Clear existing
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        root_name = os.path.basename(self.current_root) or self.current_root
+        root_node = self.tree.insert("", "end", text=f"📁 {root_name}",
+                                      values=(self.current_root,), open=True)
+        self._populate_children(root_node, self.current_root)
+
+    def _populate_children(self, parent_node, dir_path: str):
+        # Clear placeholder children
+        for child in self.tree.get_children(parent_node):
+            self.tree.delete(child)
+
+        try:
+            entries = sorted(os.listdir(dir_path))
+        except PermissionError:
+            self.tree.insert(parent_node, "end", text="⚠️ Permission denied", values=("",))
+            return
+        except OSError:
+            return
+
+        # Separate dirs and files, sort dirs first
+        dirs = []
+        files = []
+        for entry in entries:
+            if self._should_hide(entry):
+                continue
+            full_path = os.path.join(dir_path, entry)
+            if os.path.isdir(full_path):
+                dirs.append((entry, full_path))
+            else:
+                files.append((entry, full_path))
+
+        # Add directories
+        for name, full_path in sorted(dirs, key=lambda x: x[0].lower()):
+            node = self.tree.insert(parent_node, "end", text=f"📁 {name}",
+                                     values=(full_path,))
+            # Add placeholder so expand arrow shows
+            self.tree.insert(node, "end", text="...", values=("__placeholder__",))
+
+        # Add files
+        for name, full_path in sorted(files, key=lambda x: x[0].lower()):
+            ext = os.path.splitext(name)[1].lower()
+            icon, _ = FILE_ICONS.get(ext, ("📄", THEME["text_dim"]))
+            self.tree.insert(parent_node, "end", text=f"{icon} {name}",
+                              values=(full_path,))
+
+    def _on_expand(self, event):
+        node = self.tree.focus()
+        children = self.tree.get_children(node)
+        # Check if this has the placeholder
+        if len(children) == 1:
+            vals = self.tree.item(children[0], "values")
+            if vals and vals[0] == "__placeholder__":
+                path = self.tree.item(node, "values")[0]
+                self._populate_children(node, path)
+
+    def _on_double_click(self, event):
+        node = self.tree.focus()
+        if not node:
+            return
+        vals = self.tree.item(node, "values")
+        if not vals or not vals[0] or vals[0] == "__placeholder__":
+            return
+        path = vals[0]
+        if os.path.isfile(path):
+            FileViewerPopup(self.winfo_toplevel(), path)
+
+    def _get_selected_path(self) -> Optional[str]:
+        node = self.tree.focus()
+        if not node:
+            return None
+        vals = self.tree.item(node, "values")
+        if not vals or not vals[0] or vals[0] == "__placeholder__":
+            return None
+        return vals[0]
+
+    def _copy_selected_path(self):
+        path = self._get_selected_path()
+        if path:
+            self.clipboard_clear()
+            self.clipboard_append(path)
+
+    def _send_to_chat(self):
+        path = self._get_selected_path()
+        if path and self.chat_input_callback:
+            self.chat_input_callback(path)
+
+    def _view_selected(self):
+        path = self._get_selected_path()
+        if path and os.path.isfile(path):
+            FileViewerPopup(self.winfo_toplevel(), path)
+
+    def _open_in_system(self):
+        path = self._get_selected_path()
+        if path:
+            target = path if os.path.isdir(path) else os.path.dirname(path)
+            if sys.platform == "win32":
+                os.startfile(target)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", target])
+            else:
+                subprocess.Popen(["xdg-open", target])
+
+    def _show_ctx_menu(self, event):
+        # Select the item under cursor
+        item = self.tree.identify_row(event.y)
+        if item:
+            self.tree.selection_set(item)
+            self.tree.focus(item)
+        try:
+            self._ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx_menu.grab_release()
+
+
+# ==========================================
+# CHAT PANEL
+# ==========================================
+
+class ChatPanel(CTkScrollableFrame):
+    """Scrollable chat message panel."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.configure(fg_color=THEME["bg_dark"])
+        self.messages = []
+
+    def add_message(self, role: str, content: str, timestamp: str = ""):
+        if not timestamp:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+
+        msg = ChatMessage(self, role, content, timestamp)
+        msg.pack(fill="x", padx=5, pady=5, anchor="w" if role != "user" else "e")
+        self.messages.append(msg)
+
+        self.after(50, lambda: self._parent_canvas.yview_moveto(1.0))
+
+    def clear(self):
+        for msg in self.messages:
+            msg.destroy()
+        self.messages = []
+
+
+# ==========================================
+# SKILL CARD WIDGET
+# ==========================================
+
+class SkillCard(CTkFrame):
+    """A card widget displaying a single marketplace skill."""
+
+    def __init__(self, parent, skill, on_action=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.skill = skill
+        self.on_action = on_action
+
+        self.configure(fg_color=THEME["bg_card"], corner_radius=8)
+
+        # Determine if this is a MarketplaceSkill or builtin Skill
+        is_marketplace = hasattr(skill, 'source_repo')
+
+        # Header row
+        header = CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=8, pady=(6, 2))
+
+        # Category badge color
+        if is_marketplace:
+            cat = getattr(skill, 'category', 'community')
+        else:
+            cat = 'builtin'
+
+        badge_colors = {
+            "official": THEME["official_color"],
+            "community": THEME["community_color"],
+            "specialized": THEME["specialized_color"],
+            "custom": THEME["custom_color"],
+            "builtin": THEME["accent_cyan"],
+        }
+        badge_color = badge_colors.get(cat, THEME["text_dim"])
+
+        # Verified badge
+        name_text = skill.name
+        if is_marketplace and getattr(skill, 'verified', False):
+            name_text = f"✓ {name_text}"
+
+        name_label = CTkLabel(
+            header,
+            text=name_text,
+            font=("Consolas", 12, "bold"),
+            text_color=THEME["text_primary"],
+            anchor="w"
+        )
+        name_label.pack(side="left", fill="x", expand=True)
+
+        # Category badge
+        cat_label = CTkLabel(
+            header,
+            text=cat.upper(),
+            font=("Consolas", 8),
+            text_color=badge_color,
+        )
+        cat_label.pack(side="right")
+
+        # Description
+        desc = getattr(skill, 'description', '')[:120]
+        if desc:
+            desc_label = CTkLabel(
+                self,
+                text=desc,
+                font=("Consolas", 10),
+                text_color=THEME["text_secondary"],
+                wraplength=280,
+                justify="left",
+                anchor="w"
+            )
+            desc_label.pack(fill="x", padx=8, pady=(0, 2))
+
+        # Tags row
+        if is_marketplace and getattr(skill, 'tags', []):
+            tags_text = " ".join(f"#{t}" for t in skill.tags[:4])
+            tags_label = CTkLabel(
+                self,
+                text=tags_text,
+                font=("Consolas", 9),
+                text_color=THEME["accent_purple"],
+                anchor="w"
+            )
+            tags_label.pack(fill="x", padx=8, pady=(0, 2))
+
+        # Source
+        if is_marketplace:
+            source_text = f"from {skill.source_repo}"
+        else:
+            source_text = f"builtin v{skill.version}"
+
+        source_label = CTkLabel(
+            self,
+            text=source_text,
+            font=("Consolas", 9),
+            text_color=THEME["text_dim"],
+            anchor="w"
+        )
+        source_label.pack(fill="x", padx=8, pady=(0, 2))
+
+        # Action buttons row
+        btn_frame = CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=8, pady=(2, 6))
+
+        # Determine state and buttons
+        if is_marketplace:
+            is_installed = getattr(skill, 'installed', False)
+            is_active = getattr(skill, 'active', False)
+        else:
+            # Builtin skill - check via skill_manager if available in parent chain
+            is_installed = True  # builtins are always "installed"
+            # Check if skill is active by looking at the skill object's installed flag
+            is_active = getattr(skill, 'installed', False) and skill.id in getattr(skill, '_active_ids', set())
+            # Fallback: builtins show as installed but not active by default
+            # The actual active state is managed by SkillManager and reflected on refresh
+            if hasattr(parent, 'master') and hasattr(parent.master, 'skill_manager'):
+                sm = parent.master.skill_manager
+                is_active = skill.id in getattr(sm, 'active_skills', {})
+
+        if is_active:
+            # Show deactivate button
+            deact_btn = CTkButton(
+                btn_frame, text="Deactivate", width=80, height=24,
+                font=("Consolas", 9),
+                fg_color=THEME["error_color"], hover_color="#cc3333",
+                command=lambda: self._do_action("deactivate")
+            )
+            deact_btn.pack(side="left", padx=2)
+
+            status_label = CTkLabel(
+                btn_frame, text="ACTIVE", font=("Consolas", 9, "bold"),
+                text_color=THEME["success_color"]
+            )
+            status_label.pack(side="right", padx=4)
+
+        elif is_installed:
+            # Show activate button
+            act_btn = CTkButton(
+                btn_frame, text="Activate", width=70, height=24,
+                font=("Consolas", 9),
+                fg_color=THEME["success_color"], hover_color="#33cc33",
+                text_color="#000000",
+                command=lambda: self._do_action("activate")
+            )
+            act_btn.pack(side="left", padx=2)
+
+            # Uninstall button (not for builtins)
+            if is_marketplace:
+                uninst_btn = CTkButton(
+                    btn_frame, text="Uninstall", width=70, height=24,
+                    font=("Consolas", 9),
+                    fg_color=THEME["bg_light"], hover_color=THEME["error_color"],
+                    command=lambda: self._do_action("uninstall")
+                )
+                uninst_btn.pack(side="left", padx=2)
+
+            status_label = CTkLabel(
+                btn_frame, text="INSTALLED", font=("Consolas", 9),
+                text_color=THEME["accent_cyan"]
+            )
+            status_label.pack(side="right", padx=4)
+
+        else:
+            # Show install button
+            inst_btn = CTkButton(
+                btn_frame, text="Install", width=70, height=24,
+                font=("Consolas", 9),
+                fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+                command=lambda: self._do_action("install")
+            )
+            inst_btn.pack(side="left", padx=2)
+
+            # Detail button
+            detail_btn = CTkButton(
+                btn_frame, text="Details", width=60, height=24,
+                font=("Consolas", 9),
+                fg_color=THEME["bg_light"], hover_color=THEME["accent_blue"],
+                command=lambda: self._do_action("details")
+            )
+            detail_btn.pack(side="left", padx=2)
+
+    def _do_action(self, action: str):
+        if self.on_action:
+            skill_id = self.skill.id if hasattr(self.skill, 'id') else getattr(self.skill, 'id', '')
+            self.on_action(action, skill_id, self.skill)
+
+
+# ==========================================
+# SKILL DETAIL POPUP
+# ==========================================
+
+class SkillDetailPopup(CTkToplevel):
+    """Popup window showing full skill details."""
+
+    def __init__(self, parent, skill, marketplace_engine=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.title(f"Skill: {skill.name}")
+        self.geometry("600x500")
+        self.configure(fg_color=THEME["bg_dark"])
+
+        # Make modal
+        self.transient(parent)
+        self.grab_set()
+
+        # Header
+        header = CTkFrame(self, fg_color=THEME["bg_medium"], corner_radius=10)
+        header.pack(fill="x", padx=10, pady=10)
+
+        CTkLabel(
+            header, text=skill.name,
+            font=("Consolas", 18, "bold"),
+            text_color=THEME["accent_magenta"]
+        ).pack(padx=10, pady=(10, 2))
+
+        CTkLabel(
+            header, text=skill.description,
+            font=("Consolas", 11),
+            text_color=THEME["text_secondary"],
+            wraplength=550
+        ).pack(padx=10, pady=(0, 10))
+
+        # Info grid
+        info_frame = CTkFrame(self, fg_color=THEME["bg_medium"], corner_radius=10)
+        info_frame.pack(fill="x", padx=10, pady=5)
+
+        is_mp = hasattr(skill, 'source_repo')
+        info_items = [
+            ("Source", getattr(skill, 'source_repo', 'builtin')),
+            ("Category", getattr(skill, 'category', 'N/A')),
+            ("Version", getattr(skill, 'version', '1.0.0')),
+            ("Author", getattr(skill, 'author', 'Unknown')),
+            ("Verified", "Yes" if getattr(skill, 'verified', False) else "No"),
+            ("Tags", ", ".join(getattr(skill, 'tags', [])) or "None"),
+        ]
+
+        for label, value in info_items:
+            row = CTkFrame(info_frame, fg_color="transparent")
+            row.pack(fill="x", padx=10, pady=1)
+            CTkLabel(row, text=f"{label}:", font=("Consolas", 10, "bold"),
+                     text_color=THEME["accent_cyan"], width=80, anchor="w").pack(side="left")
+            CTkLabel(row, text=str(value), font=("Consolas", 10),
+                     text_color=THEME["text_primary"], anchor="w").pack(side="left", fill="x", expand=True)
+
+        # Content
+        CTkLabel(
+            self, text="SKILL.md Content:",
+            font=("Consolas", 11, "bold"),
+            text_color=THEME["accent_cyan"]
+        ).pack(padx=10, pady=(10, 2), anchor="w")
+
+        content_box = CTkTextbox(
+            self, font=("Consolas", 10),
+            fg_color=THEME["bg_light"],
+            text_color=THEME["text_primary"],
+            wrap="word"
+        )
+        content_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Get content
+        if marketplace_engine and is_mp:
+            content = marketplace_engine.get_skill_content(skill.id)
+        else:
+            content = getattr(skill, 'content', '') or getattr(skill, 'system_prompt_addition', 'No content available.')
+
+        content_box.insert("1.0", content)
+        content_box.configure(state="disabled")
+
+        # Close button
+        CTkButton(
+            self, text="Close", command=self.destroy,
+            fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+            width=100
+        ).pack(pady=10)
+
+
+# ==========================================
+# CREATE SKILL POPUP
+# ==========================================
+
+class CreateSkillPopup(CTkToplevel):
+    """Popup for creating a custom skill."""
+
+    def __init__(self, parent, marketplace_engine, on_created=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.title("Create Custom Skill")
+        self.geometry("600x550")
+        self.configure(fg_color=THEME["bg_dark"])
+        self.marketplace_engine = marketplace_engine
+        self.on_created = on_created
+
+        self.transient(parent)
+        self.grab_set()
+
+        CTkLabel(
+            self, text="Create Custom Skill",
+            font=("Consolas", 18, "bold"),
+            text_color=THEME["accent_magenta"]
+        ).pack(pady=10)
+
+        # Name
+        CTkLabel(self, text="Name:", font=("Consolas", 11),
+                 text_color=THEME["accent_cyan"]).pack(padx=20, anchor="w")
+        self.name_entry = CTkEntry(self, font=("Consolas", 12),
+                                   fg_color=THEME["bg_light"], text_color=THEME["text_primary"])
+        self.name_entry.pack(fill="x", padx=20, pady=(0, 10))
+
+        # Description
+        CTkLabel(self, text="Description:", font=("Consolas", 11),
+                 text_color=THEME["accent_cyan"]).pack(padx=20, anchor="w")
+        self.desc_entry = CTkEntry(self, font=("Consolas", 12),
+                                   fg_color=THEME["bg_light"], text_color=THEME["text_primary"])
+        self.desc_entry.pack(fill="x", padx=20, pady=(0, 10))
+
+        # Tags
+        CTkLabel(self, text="Tags (comma-separated):", font=("Consolas", 11),
+                 text_color=THEME["accent_cyan"]).pack(padx=20, anchor="w")
+        self.tags_entry = CTkEntry(self, font=("Consolas", 12),
+                                   fg_color=THEME["bg_light"], text_color=THEME["text_primary"])
+        self.tags_entry.pack(fill="x", padx=20, pady=(0, 10))
+
+        # Content
+        CTkLabel(self, text="Skill Instructions (SKILL.md content):", font=("Consolas", 11),
+                 text_color=THEME["accent_cyan"]).pack(padx=20, anchor="w")
+        self.content_box = CTkTextbox(
+            self, font=("Consolas", 11),
+            fg_color=THEME["bg_light"], text_color=THEME["text_primary"],
+            wrap="word", height=200
+        )
+        self.content_box.pack(fill="both", expand=True, padx=20, pady=(0, 10))
+        self.content_box.insert("1.0", "# My Custom Skill\n\n## Instructions\n\nDescribe what this skill teaches the agent to do...\n")
+
+        # Buttons
+        btn_frame = CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=20, pady=10)
+
+        CTkButton(
+            btn_frame, text="Create Skill", command=self._create,
+            fg_color=THEME["success_color"], hover_color="#33cc33",
+            text_color="#000000", font=("Consolas", 12, "bold")
+        ).pack(side="left", padx=5)
+
+        CTkButton(
+            btn_frame, text="Cancel", command=self.destroy,
+            fg_color=THEME["bg_light"], hover_color=THEME["error_color"],
+            font=("Consolas", 12)
+        ).pack(side="right", padx=5)
+
+    def _create(self):
+        name = self.name_entry.get().strip()
+        desc = self.desc_entry.get().strip()
+        tags_str = self.tags_entry.get().strip()
+        content = self.content_box.get("1.0", "end").strip()
+
+        if not name:
+            messagebox.showwarning("Missing Name", "Please enter a skill name.")
+            return
+        if not content:
+            messagebox.showwarning("Missing Content", "Please enter skill instructions.")
+            return
+
+        tags = [t.strip() for t in tags_str.split(",") if t.strip()] if tags_str else []
+
+        result = self.marketplace_engine.create_custom_skill(name, desc or name, content, tags)
+
+        if self.on_created:
+            self.on_created(result)
+
+        self.destroy()
+
+
+# ==========================================
+# ENHANCED SKILLS MARKETPLACE PANEL
+# ==========================================
+
+class MarketplacePanel(CTkFrame):
+    """Full marketplace panel with tabs, search, and skill cards."""
+
+    def __init__(self, parent, skill_manager, chat_callback=None, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.skill_manager = skill_manager
+        self.chat_callback = chat_callback
+        self.configure(fg_color=THEME["bg_medium"])
+
+        # Initialize marketplace engine
+        self.marketplace_engine = None
+        if SkillsMarketplaceEngine:
+            self.marketplace_engine = SkillsMarketplaceEngine()
+
+        # Title
+        title_frame = CTkFrame(self, fg_color="transparent")
+        title_frame.pack(fill="x", padx=5, pady=(5, 0))
+
+        CTkLabel(
+            title_frame, text="SKILLS MARKETPLACE",
+            font=("Consolas", 13, "bold"),
+            text_color=THEME["accent_cyan"]
+        ).pack(side="left", padx=5)
+
+        # Stats label
+        self.stats_label = CTkLabel(
+            title_frame, text="",
+            font=("Consolas", 9),
+            text_color=THEME["text_dim"]
+        )
+        self.stats_label.pack(side="right", padx=5)
+
+        # Search bar
+        search_frame = CTkFrame(self, fg_color="transparent")
+        search_frame.pack(fill="x", padx=5, pady=5)
+
+        self.search_entry = CTkEntry(
+            search_frame,
+            placeholder_text="Search skills...",
+            font=("Consolas", 10),
+            height=28,
+            fg_color=THEME["bg_dark"],
+            border_color=THEME["accent_purple"],
+            text_color=THEME["text_primary"]
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 3))
+        self.search_entry.bind("<Return>", lambda e: self._do_search())
+
+        CTkButton(
+            search_frame, text="Go", width=35, height=28,
+            font=("Consolas", 9),
+            fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+            command=self._do_search
+        ).pack(side="right")
+
+        # Tab view
+        self.tabview = CTkTabview(
+            self, fg_color=THEME["bg_dark"],
+            segmented_button_fg_color=THEME["bg_light"],
+            segmented_button_selected_color=THEME["accent_purple"],
+            segmented_button_unselected_color=THEME["bg_medium"],
+        )
+        self.tabview.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Create tabs
+        self.tab_browse = self.tabview.add("Browse")
+        self.tab_installed = self.tabview.add("Installed")
+        self.tab_active = self.tabview.add("Active")
+        self.tab_sources = self.tabview.add("Sources")
+
+        # Browse tab content
+        self._build_browse_tab()
+
+        # Installed tab content
+        self._build_installed_tab()
+
+        # Active tab content
+        self._build_active_tab()
+
+        # Sources tab content
+        self._build_sources_tab()
+
+        # Action buttons at bottom
+        self._build_action_buttons()
+
+        # Initial populate
+        self._refresh_all_tabs()
+
+    def _build_browse_tab(self):
+        """Build the browse/marketplace tab."""
+        # Category filter
+        filter_frame = CTkFrame(self.tab_browse, fg_color="transparent")
+        filter_frame.pack(fill="x", padx=2, pady=2)
+
+        self.category_var = ctk.StringVar(value="All")
+        categories = ["All", "Official", "Community", "Specialized", "Custom", "Builtin"]
+
+        CTkOptionMenu(
+            filter_frame,
+            values=categories,
+            variable=self.category_var,
+            command=lambda _: self._populate_browse(),
+            font=("Consolas", 9),
+            fg_color=THEME["bg_light"],
+            button_color=THEME["accent_purple"],
+            button_hover_color=THEME["accent_magenta"],
+            width=100, height=24
+        ).pack(side="left", padx=2)
+
+        # Skill list
+        self.browse_list = CTkScrollableFrame(
+            self.tab_browse, fg_color=THEME["bg_dark"]
+        )
+        self.browse_list.pack(fill="both", expand=True, padx=2, pady=2)
+
+    def _build_installed_tab(self):
+        self.installed_list = CTkScrollableFrame(
+            self.tab_installed, fg_color=THEME["bg_dark"]
+        )
+        self.installed_list.pack(fill="both", expand=True, padx=2, pady=2)
+
+    def _build_active_tab(self):
+        self.active_list = CTkScrollableFrame(
+            self.tab_active, fg_color=THEME["bg_dark"]
+        )
+        self.active_list.pack(fill="both", expand=True, padx=2, pady=2)
+
+    def _build_sources_tab(self):
+        self.sources_list = CTkScrollableFrame(
+            self.tab_sources, fg_color=THEME["bg_dark"]
+        )
+        self.sources_list.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # Add source button
+        add_frame = CTkFrame(self.tab_sources, fg_color="transparent")
+        add_frame.pack(fill="x", padx=2, pady=5)
+
+        self.source_entry = CTkEntry(
+            add_frame,
+            placeholder_text="owner/repo or GitHub URL",
+            font=("Consolas", 9), height=26,
+            fg_color=THEME["bg_dark"],
+            text_color=THEME["text_primary"]
+        )
+        self.source_entry.pack(side="left", fill="x", expand=True, padx=(0, 3))
+
+        CTkButton(
+            add_frame, text="Add", width=40, height=26,
+            font=("Consolas", 9),
+            fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+            command=self._add_source
+        ).pack(side="right")
+
+    def _build_action_buttons(self):
+        btn_frame = CTkFrame(self, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=5, pady=5)
+
+        CTkButton(
+            btn_frame, text="Fetch All", height=26,
+            font=("Consolas", 9, "bold"),
+            fg_color=THEME["accent_magenta"], hover_color=THEME["accent_purple"],
+            command=self._fetch_all_sources
+        ).pack(side="left", fill="x", expand=True, padx=2)
+
+        CTkButton(
+            btn_frame, text="Create", height=26,
+            font=("Consolas", 9),
+            fg_color=THEME["success_color"], hover_color="#33cc33",
+            text_color="#000000",
+            command=self._create_skill
+        ).pack(side="left", fill="x", expand=True, padx=2)
+
+        CTkButton(
+            btn_frame, text="GitHub", height=26,
+            font=("Consolas", 9),
+            fg_color=THEME["accent_blue"], hover_color="#3377dd",
+            command=self._install_from_url
+        ).pack(side="left", fill="x", expand=True, padx=2)
+
+    # ------------------------------------------
+    # POPULATE TABS
+    # ------------------------------------------
+
+    def _refresh_all_tabs(self):
+        self._populate_browse()
+        self._populate_installed()
+        self._populate_active()
+        self._populate_sources()
+        self._update_stats()
+
+    def _clear_frame(self, frame):
+        for widget in frame.winfo_children():
+            widget.destroy()
+
+    def _populate_browse(self):
+        self._clear_frame(self.browse_list)
+        category_filter = self.category_var.get().lower()
+
+        skills = []
+
+        # Add builtin skills
+        for skill_id, skill in BUILTIN_SKILLS.items():
+            if category_filter in ("all", "builtin"):
+                skills.append(("builtin", skill))
+
+        # Add marketplace skills
+        if self.marketplace_engine:
+            for skill in self.marketplace_engine.registry.values():
+                if category_filter == "all" or category_filter == skill.category:
+                    skills.append(("marketplace", skill))
+
+        if not skills:
+            CTkLabel(
+                self.browse_list,
+                text="No skills found.\nClick 'Fetch All' to download from sources.",
+                font=("Consolas", 10),
+                text_color=THEME["text_dim"]
+            ).pack(pady=20)
+            return
+
+        for source_type, skill in skills:
+            card = SkillCard(
+                self.browse_list, skill,
+                on_action=self._handle_skill_action
+            )
+            card.pack(fill="x", padx=2, pady=2)
+
+    def _populate_installed(self):
+        self._clear_frame(self.installed_list)
+
+        skills = []
+        if self.marketplace_engine:
+            skills = self.marketplace_engine.get_installed_skills()
+
+        if not skills:
+            CTkLabel(
+                self.installed_list,
+                text="No installed skills yet.",
+                font=("Consolas", 10),
+                text_color=THEME["text_dim"]
+            ).pack(pady=20)
+            return
+
+        for skill in skills:
+            card = SkillCard(self.installed_list, skill, on_action=self._handle_skill_action)
+            card.pack(fill="x", padx=2, pady=2)
+
+    def _populate_active(self):
+        self._clear_frame(self.active_list)
+        skills = []
+        if self.marketplace_engine:
+            skills = self.marketplace_engine.get_active_skills()
+
+        if not skills:
+            CTkLabel(
+                self.active_list,
+                text="No active skills.\nActivate installed skills to use them.",
+                font=("Consolas", 10),
+                text_color=THEME["text_dim"]
+            ).pack(pady=20)
+            return
+
+        for skill in skills:
+            card = SkillCard(self.active_list, skill, on_action=self._handle_skill_action)
+            card.pack(fill="x", padx=2, pady=2)
+
+    def _populate_sources(self):
+        self._clear_frame(self.sources_list)
+        if not self.marketplace_engine:
+            return
+        all_sources = self.marketplace_engine.get_all_sources()
+        for repo_id, info in all_sources.items():
+            row = CTkFrame(self.sources_list, fg_color=THEME["bg_card"], corner_radius=6)
+            row.pack(fill="x", padx=2, pady=2)
+            is_custom = repo_id in self.marketplace_engine.custom_sources
+            badge = "CUSTOM" if is_custom else info.get("category", "").upper()
+            badge_color = THEME["custom_color"] if is_custom else THEME["official_color"]
+            CTkLabel(row, text=badge, font=("Consolas", 8), text_color=badge_color).pack(side="left", padx=4)
+            CTkLabel(row, text=repo_id, font=("Consolas", 10, "bold"),
+                     text_color=THEME["text_primary"]).pack(side="left", padx=4)
+            CTkLabel(row, text=info.get("description", "")[:50], font=("Consolas", 9),
+                     text_color=THEME["text_secondary"]).pack(side="left", fill="x", expand=True, padx=4)
+            CTkButton(
+                row, text="Fetch", width=45, height=22, font=("Consolas", 8),
+                fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+                command=lambda rid=repo_id: self._fetch_single_source(rid)
+            ).pack(side="right", padx=2, pady=2)
+            if is_custom:
+                CTkButton(
+                    row, text="X", width=22, height=22, font=("Consolas", 8),
+                    fg_color=THEME["error_color"], hover_color="#cc3333",
+                    command=lambda rid=repo_id: self._remove_source(rid)
+                ).pack(side="right", padx=2, pady=2)
+
+    def _update_stats(self):
+        if not self.marketplace_engine:
+            self.stats_label.configure(text="No engine")
+            return
+        stats = self.marketplace_engine.get_stats()
+        self.stats_label.configure(
+            text=f"{stats['total_skills']} skills | {stats['installed']} installed | {stats['active']} active"
+        )
+
+    # ------------------------------------------
+    # ACTIONS
+    # ------------------------------------------
+
+    def _handle_skill_action(self, action: str, skill_id: str, skill):
+        msg = ""
+        
+        # Check if this is a builtin skill (from BUILTIN_SKILLS)
+        is_builtin = skill_id in BUILTIN_SKILLS
+        
+        if action == "details":
+            SkillDetailPopup(self.winfo_toplevel(), skill, self.marketplace_engine)
+            return
+        
+        if is_builtin:
+            # Handle builtin skills via skill_manager
+            if action == "install":
+                msg = self.skill_manager.install_skill(skill_id)
+            elif action == "uninstall":
+                msg = f"Cannot uninstall builtin skill: {skill_id}"
+            elif action == "activate":
+                # First install if not installed
+                if skill_id not in self.skill_manager.installed_skills:
+                    install_msg = self.skill_manager.install_skill(skill_id)
+                    if self.chat_callback:
+                        self.chat_callback("system", install_msg)
+                msg = self.skill_manager.activate_skill(skill_id)
+            elif action == "deactivate":
+                msg = self.skill_manager.deactivate_skill(skill_id)
+        else:
+            # Handle marketplace skills via marketplace_engine
+            if not self.marketplace_engine:
+                msg = "Marketplace engine not available"
+            elif action == "install":
+                msg = self.marketplace_engine.install_skill(skill_id)
+            elif action == "uninstall":
+                msg = self.marketplace_engine.uninstall_skill(skill_id)
+            elif action == "activate":
+                msg = self.marketplace_engine.activate_skill(skill_id)
+            elif action == "deactivate":
+                msg = self.marketplace_engine.deactivate_skill(skill_id)
+
+        if msg and self.chat_callback:
+            self.chat_callback("system", msg)
+        self._refresh_all_tabs()
+
+    def _do_search(self):
+        query = self.search_entry.get().strip()
+        if not query or not self.marketplace_engine:
+            self._populate_browse()
+            return
+        self._clear_frame(self.browse_list)
+        results = self.marketplace_engine.search_skills(query)
+        if not results:
+            CTkLabel(self.browse_list, text=f"No results for '{query}'",
+                     font=("Consolas", 10), text_color=THEME["text_dim"]).pack(pady=20)
+            return
+        for skill in results:
+            card = SkillCard(self.browse_list, skill, on_action=self._handle_skill_action)
+            card.pack(fill="x", padx=2, pady=2)
+
+    def _fetch_all_sources(self):
+        engine = self.marketplace_engine
+        if not engine:
+            return
+        if self.chat_callback:
+            self.chat_callback("system", "Fetching skills from all sources...")
+
+        def _do_fetch():
+            total, messages = engine.fetch_all_sources()
+            self.after(0, lambda: self._on_fetch_done(messages))
+
+        threading.Thread(target=_do_fetch, daemon=True).start()
+
+    def _on_fetch_done(self, messages):
+        self._refresh_all_tabs()
+        if self.chat_callback:
+            self.chat_callback("system", "\n".join(messages))
+
+    def _fetch_single_source(self, repo_id):
+        engine = self.marketplace_engine
+        if not engine:
+            return
+        if self.chat_callback:
+            self.chat_callback("system", f"Fetching from {repo_id}...")
+
+        def _do():
+            count, msgs = engine.fetch_skills_from_source(repo_id)
+            self.after(0, lambda: self._on_fetch_done(msgs))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _add_source(self):
+        url = self.source_entry.get().strip()
+        if not url or not self.marketplace_engine:
+            return
+        result = self.marketplace_engine.add_source(url)
+        self.source_entry.delete(0, "end")
+        self._populate_sources()
+        if self.chat_callback:
+            self.chat_callback("system", str(result or "Source added"))
+
+    def _remove_source(self, repo_id):
+        if not self.marketplace_engine:
+            return
+        result = self.marketplace_engine.remove_source(repo_id)
+        self._populate_sources()
+        if self.chat_callback:
+            self.chat_callback("system", str(result or "Source removed"))
+
+    def _create_skill(self):
+        if not self.marketplace_engine:
+            return
+        def on_created(result):
+            self._refresh_all_tabs()
+            if self.chat_callback:
+                self.chat_callback("system", str(result or "Skill created"))
+        CreateSkillPopup(self.winfo_toplevel(), self.marketplace_engine, on_created)
+
+    def _install_from_url(self):
+        engine = self.marketplace_engine
+        if not engine:
+            return
+        dialog = CTkToplevel(self.winfo_toplevel())
+        dialog.title("Install from GitHub")
+        dialog.geometry("450x150")
+        dialog.configure(fg_color=THEME["bg_dark"])
+        dialog.transient(self.winfo_toplevel())
+        dialog.grab_set()
+
+        CTkLabel(dialog, text="Enter GitHub repo (owner/repo or URL):",
+                 font=("Consolas", 11), text_color=THEME["accent_cyan"]).pack(padx=15, pady=(15, 5))
+        entry = CTkEntry(dialog, font=("Consolas", 12), fg_color=THEME["bg_light"],
+                         text_color=THEME["text_primary"])
+        entry.pack(fill="x", padx=15, pady=5)
+
+        def do_install():
+            url = entry.get().strip()
+            if url:
+                dialog.destroy()
+                if self.chat_callback:
+                    self.chat_callback("system", f"Installing from {url}...")
+                def _do():
+                    result = engine.install_from_github_url(url)
+                    self.after(0, lambda: self._on_fetch_done([str(result or "Done")]))
+                threading.Thread(target=_do, daemon=True).start()
+
+        CTkButton(dialog, text="Install", command=do_install,
+                  fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+                  font=("Consolas", 12, "bold")).pack(pady=10)
+
+
+# ==========================================
+# CIRCULAR AUDIO VISUALIZER
+# ==========================================
+
+class CircularAudioVisualizer(tk.Canvas):
+    """
+    Cyberpunk circular audio visualizer using tkinter Canvas.
+    Draws radial bars in a circle with animated heights.
+    States: idle, listening, processing, speaking
+    """
+
+    NUM_BARS = 72
+    FPS = 30
+
+    # State color schemes
+    STATE_COLORS = {
+        "idle": {"primary": "#9d4edd", "secondary": "#4488ff", "glow": "#9d4edd"},
+        "listening": {"primary": "#ff4444", "secondary": "#ff00ff", "glow": "#ff4444"},
+        "processing": {"primary": "#ffaa00", "secondary": "#ff8844", "glow": "#ffaa00"},
+        "speaking": {"primary": "#00ffff", "secondary": "#ff00ff", "glow": "#00ffff"},
+    }
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, bg=THEME["bg_dark"], highlightthickness=0, **kwargs)
+        self._state = "idle"
+        self._animating = False
+        self._frame = 0
+        self._bar_heights: list = [0.0] * self.NUM_BARS
+        self._target_heights: list = [0.0] * self.NUM_BARS
+        self._status_text = "Ready"
+        self._center_text = "TripleG-Sam"
+        self._glow_phase = 0.0
+
+        # Bind resize
+        self.bind("<Configure>", self._on_resize)
+
+    def set_state(self, state: str, status_text: str = ""):
+        """Set visualizer state: idle, listening, processing, speaking."""
+        self._state = state
+        if status_text:
+            self._status_text = status_text
+        else:
+            defaults = {
+                "idle": "Ready to listen...",
+                "listening": "Listening...",
+                "processing": "Processing...",
+                "speaking": "Speaking...",
+            }
+            self._status_text = defaults.get(state, "")
+
+    def start_animation(self):
+        """Start the animation loop."""
+        if self._animating:
+            return
+        self._animating = True
+        self._animate()
+
+    def stop_animation(self):
+        """Stop the animation loop."""
+        self._animating = False
+
+    def _on_resize(self, event):
+        """Handle canvas resize."""
+        if self._animating:
+            self._draw()
+
+    def _animate(self):
+        """Main animation loop at ~30fps."""
+        if not self._animating:
+            return
+        self._frame += 1
+        self._glow_phase += 0.05
+        self._update_bar_targets()
+        self._interpolate_bars()
+        self._draw()
+        self.after(1000 // self.FPS, self._animate)
+
+    def _update_bar_targets(self):
+        """Update target bar heights based on current state."""
+        t = self._frame / self.FPS
+
+        if self._state == "idle":
+            # Gentle breathing wave
+            for i in range(self.NUM_BARS):
+                angle_offset = (i / self.NUM_BARS) * math.pi * 4
+                self._target_heights[i] = 0.15 + 0.1 * math.sin(t * 0.8 + angle_offset)
+
+        elif self._state == "listening":
+            # Pulsing with random spikes (simulating mic input)
+            for i in range(self.NUM_BARS):
+                base = 0.3 + 0.15 * math.sin(t * 2.0 + i * 0.2)
+                spike = random.random() * 0.5 if random.random() > 0.7 else 0
+                self._target_heights[i] = min(1.0, base + spike)
+
+        elif self._state == "processing":
+            # Rotating spinner effect
+            for i in range(self.NUM_BARS):
+                pos = (i / self.NUM_BARS + t * 0.3) % 1.0
+                # Create 3 bright spots rotating
+                brightness = 0.1
+                for k in range(3):
+                    spot = (k / 3.0 + t * 0.15) % 1.0
+                    dist = min(abs(pos - spot), 1.0 - abs(pos - spot))
+                    brightness += max(0, 0.6 - dist * 6)
+                self._target_heights[i] = min(1.0, brightness)
+
+        elif self._state == "speaking":
+            # Dynamic audio-like visualization
+            for i in range(self.NUM_BARS):
+                # Multiple frequency components
+                f1 = 0.3 * math.sin(t * 3.0 + i * 0.15)
+                f2 = 0.2 * math.sin(t * 5.0 + i * 0.3)
+                f3 = 0.15 * math.sin(t * 7.0 + i * 0.08)
+                noise = random.random() * 0.15
+                self._target_heights[i] = min(1.0, max(0.05, 0.35 + f1 + f2 + f3 + noise))
+
+    def _interpolate_bars(self):
+        """Smoothly interpolate bar heights toward targets."""
+        lerp_speed = 0.25 if self._state == "speaking" else 0.15
+        for i in range(self.NUM_BARS):
+            diff = self._target_heights[i] - self._bar_heights[i]
+            self._bar_heights[i] += diff * lerp_speed
+
+    def _hex_lerp(self, c1: str, c2: str, t: float) -> str:
+        """Linearly interpolate between two hex colors."""
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        r = int(r1 + (r2 - r1) * t)
+        g = int(g1 + (g2 - g1) * t)
+        b = int(b1 + (b2 - b1) * t)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw(self):
+        """Draw the full visualizer frame."""
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 50 or h < 50:
+            return
+
+        cx, cy = w // 2, h // 2
+        max_radius = min(cx, cy) - 20
+        inner_radius = max_radius * 0.35
+        bar_max_len = max_radius - inner_radius - 10
+
+        colors = self.STATE_COLORS.get(self._state, self.STATE_COLORS["idle"])
+
+        # Draw outer glow ring
+        glow_alpha = 0.3 + 0.15 * math.sin(self._glow_phase)
+        glow_r = max_radius + 5
+        glow_color = self._hex_lerp(THEME["bg_dark"], colors["glow"], glow_alpha)
+        self.create_oval(cx - glow_r, cy - glow_r, cx + glow_r, cy + glow_r,
+                         outline=glow_color, width=2)
+
+        # Draw radial bars
+        for i in range(self.NUM_BARS):
+            angle = (i / self.NUM_BARS) * 2 * math.pi - math.pi / 2
+            bar_len = max(2, self._bar_heights[i] * bar_max_len)
+
+            x1 = cx + math.cos(angle) * inner_radius
+            y1 = cy + math.sin(angle) * inner_radius
+            x2 = cx + math.cos(angle) * (inner_radius + bar_len)
+            y2 = cy + math.sin(angle) * (inner_radius + bar_len)
+
+            # Color gradient based on height
+            t = self._bar_heights[i]
+            color = self._hex_lerp(colors["secondary"], colors["primary"], t)
+
+            bar_width = max(2, int(3 * (max_radius / 200)))
+            self.create_line(x1, y1, x2, y2, fill=color, width=bar_width, capstyle="round")
+
+        # Draw inner circle (dark background)
+        self.create_oval(cx - inner_radius + 2, cy - inner_radius + 2,
+                         cx + inner_radius - 2, cy + inner_radius - 2,
+                         fill=THEME["bg_dark"], outline=colors["glow"], width=1)
+
+        # Center text
+        glow_brightness = 0.7 + 0.3 * math.sin(self._glow_phase * 1.5)
+        text_color = self._hex_lerp(THEME["text_dim"], colors["primary"], glow_brightness)
+        self.create_text(cx, cy - 10, text=self._center_text,
+                         font=("Consolas", 14, "bold"), fill=text_color)
+
+        # Status text below center
+        self.create_text(cx, cy + 15, text=self._status_text,
+                         font=("Consolas", 10), fill=THEME["text_secondary"])
+
+
+# ==========================================
+# STATUS PANEL
+# ==========================================
+
+class StatusPanel(CTkFrame):
+    """Bottom status bar."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.configure(fg_color=THEME["bg_medium"], height=30)
+
+        self.status_label = CTkLabel(
+            self, text="Ready", font=("Consolas", 10),
+            text_color=THEME["accent_cyan"]
+        )
+        self.status_label.pack(side="left", padx=10)
+
+        self.model_label = CTkLabel(
+            self, text=f"Model: {CONFIG['MODEL_NAME']}",
+            font=("Consolas", 9), text_color=THEME["text_dim"]
+        )
+        self.model_label.pack(side="right", padx=10)
+
+        self.api_label = CTkLabel(
+            self, text=f"API: {CONFIG['API_URL']}",
+            font=("Consolas", 9), text_color=THEME["text_dim"]
+        )
+        self.api_label.pack(side="right", padx=10)
+
+    def set_status(self, text: str, color: Optional[str] = None):
+        self.status_label.configure(text=text, text_color=color if color else THEME["accent_cyan"])
+
+
+# ==========================================
+# MAIN GUI APPLICATION
+# ==========================================
+
+class TripleGGUI(CTk):
+    """Main application window."""
+
+    def __init__(self):
+        super().__init__()
+        self.title("TripleG-Sam AI Agent")
+        self.geometry("1200x750")
+        self.minsize(900, 600)
+        self.configure(fg_color=THEME["bg_dark"])
+
+        # Backend components
+        self.skill_manager = SkillManager()
+        self.conversation_manager = SamsLawConversationManager(
+            skill_manager=self.skill_manager, use_sam=False
+        )
+        self.response_parser = ResponseParser()
+        self.response_queue = queue.Queue()
+        self.is_processing = False
+        self.terminal_enabled = False
+        self.terminal_frame = None
+        self.terminal_textbox = None
+
+        # Voice components
+        self.voice_manager: Optional[Any] = None
+        self.voice_enabled = False
+        self.voice_output_enabled = False
+        self._voice_recording = False
+        self._voice_initialized = False
+
+        # Live call mode
+        self._live_call_active = False
+        self._live_call_visualizer: Optional[CircularAudioVisualizer] = None
+        self._live_call_frame: Optional[CTkFrame] = None
+        self._live_call_mic_btn: Optional[CTkButton] = None
+        if VOICE_AVAILABLE:
+            try:
+                config = VoiceConfig(whisper_model="large", whisper_device="cuda")
+                self.voice_manager = VoiceManager(config)
+                self.voice_manager.set_state_callback(self._on_voice_state_change)
+                self.voice_manager.set_transcription_callback(self._on_voice_transcription)
+            except Exception as e:
+                print(f"[Voice] Failed to create VoiceManager: {e}")
+
+        # Build UI
+
+        self._build_ui()
+
+        # Start response polling
+        self._poll_responses()
+
+        # Welcome message
+        self.chat_panel.add_message(
+            "system",
+            "Welcome to TripleG-Sam AI Agent!\n"
+            f"Model: {CONFIG['MODEL_NAME']}\n"
+            f"API: {CONFIG['API_URL']}\n"
+            "Type a message below to start chatting."
+        )
+
+    def _build_ui(self):
+        # Main horizontal layout: [FileExplorer | Chat | Marketplace]
+        main_frame = CTkFrame(self, fg_color="transparent")
+        main_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Left: File Explorer sidebar (280px)
+        self.file_explorer = FileExplorer(
+            main_frame,
+            chat_input_callback=self._insert_path_to_chat,
+            width=280
+        )
+        self.file_explorer.pack(side="left", fill="y", padx=(0, 3))
+
+        # Center: Chat area (takes most space)
+        chat_frame = CTkFrame(main_frame, fg_color=THEME["bg_medium"], corner_radius=10)
+        chat_frame.pack(side="left", fill="both", expand=True, padx=(0, 3))
+
+        # Chat header
+        chat_header = CTkFrame(chat_frame, fg_color=THEME["bg_light"], corner_radius=8)
+        chat_header.pack(fill="x", padx=5, pady=5)
+
+        CTkLabel(
+            chat_header, text="TRIPLEG-SAM",
+            font=("Consolas", 16, "bold"),
+            text_color=THEME["accent_magenta"]
+        ).pack(side="left", padx=10, pady=5)
+
+        CTkButton(
+            chat_header, text="Clear Chat", width=80, height=26,
+            font=("Consolas", 9),
+            fg_color=THEME["bg_medium"], hover_color=THEME["error_color"],
+            command=self._clear_chat
+        ).pack(side="right", padx=5, pady=5)
+
+        CTkButton(
+            chat_header, text="New Session", width=90, height=26,
+            font=("Consolas", 9),
+            fg_color=THEME["accent_purple"], hover_color=THEME["accent_magenta"],
+            command=self._new_session
+        ).pack(side="right", padx=5, pady=5)
+
+        # 📞 Live Call button
+        mic_avail_for_call = VOICE_AVAILABLE and self.voice_manager is not None
+        self.live_call_btn = CTkButton(
+            chat_header, text="📞 Live Call", width=90, height=26,
+            font=("Consolas", 9, "bold"),
+            fg_color=THEME["success_color"] if mic_avail_for_call else THEME["bg_medium"],
+            hover_color=THEME["accent_cyan"] if mic_avail_for_call else THEME["bg_medium"],
+            text_color="#000000" if mic_avail_for_call else THEME["text_dim"],
+            command=self._toggle_live_call,
+        )
+        self.live_call_btn.pack(side="right", padx=5, pady=5)
+        if not mic_avail_for_call:
+            self.live_call_btn.configure(state="disabled")
+
+        # Terminal toggle switch
+        self.terminal_switch_var = ctk.BooleanVar(value=False)
+        self.terminal_switch = CTkSwitch(
+            chat_header,
+            text="Terminal",
+            font=("Consolas", 9),
+            text_color=THEME["accent_cyan"],
+            variable=self.terminal_switch_var,
+            command=self._toggle_terminal,
+            onvalue=True,
+            offvalue=False,
+            width=40,
+            progress_color=THEME["accent_cyan"],
+            button_color=THEME["accent_magenta"],
+            button_hover_color=THEME["accent_purple"],
+        )
+        self.terminal_switch.pack(side="right", padx=10, pady=5)
+
+        # Chat + Terminal container (uses a PanedWindow-like approach)
+        self.chat_terminal_container = CTkFrame(chat_frame, fg_color="transparent")
+        self.chat_terminal_container.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Chat messages
+        self.chat_panel = ChatPanel(self.chat_terminal_container)
+        self.chat_panel.pack(fill="both", expand=True)
+
+        # Terminal frame (hidden by default)
+        self.terminal_frame = CTkFrame(self.chat_terminal_container, fg_color=THEME["bg_dark"], corner_radius=8, height=180)
+        # Terminal header
+        self.terminal_header = CTkFrame(self.terminal_frame, fg_color=THEME["bg_light"], corner_radius=6)
+        self.terminal_header.pack(fill="x", padx=4, pady=(4, 2))
+        CTkLabel(
+            self.terminal_header, text="TERMINAL OUTPUT",
+            font=("Consolas", 10, "bold"),
+            text_color=THEME["accent_cyan"]
+        ).pack(side="left", padx=8, pady=3)
+        CTkButton(
+            self.terminal_header, text="Clear", width=50, height=20,
+            font=("Consolas", 8), fg_color=THEME["bg_medium"],
+            hover_color=THEME["error_color"], text_color=THEME["text_dim"],
+            command=self._clear_terminal
+        ).pack(side="right", padx=4, pady=3)
+        # Terminal textbox
+        self.terminal_textbox = CTkTextbox(
+            self.terminal_frame,
+            font=("Consolas", 10),
+            fg_color="#050510",
+            text_color=THEME["accent_cyan"],
+            wrap="word",
+            height=140,
+        )
+        self.terminal_textbox.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.terminal_textbox.configure(state="disabled")
+        # Terminal is hidden by default (not packed)
+
+        # Input area
+        input_frame = CTkFrame(chat_frame, fg_color="transparent")
+        input_frame.pack(fill="x", padx=5, pady=5)
+
+        self.input_entry = CTkEntry(
+            input_frame,
+            placeholder_text="Type your message...",
+            font=("Consolas", 12),
+            height=36,
+            fg_color=THEME["bg_dark"],
+            border_color=THEME["accent_purple"],
+            text_color=THEME["text_primary"]
+        )
+        self.input_entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.input_entry.bind("<Return>", lambda e: self._send_message())
+
+        self.send_btn = CTkButton(
+            input_frame, text="Send", width=70, height=36,
+            font=("Consolas", 12, "bold"),
+            fg_color=THEME["accent_magenta"], hover_color=THEME["accent_purple"],
+            command=self._send_message
+        )
+        self.send_btn.pack(side="right")
+
+        # 🎤 Microphone button (hold-to-talk)
+        mic_available = VOICE_AVAILABLE and self.voice_manager is not None
+        self.mic_btn = CTkButton(
+            input_frame, text="🎤", width=42, height=36,
+            font=("Consolas", 16),
+            fg_color=THEME["bg_light"] if mic_available else THEME["bg_dark"],
+            hover_color=THEME["error_color"] if mic_available else THEME["bg_dark"],
+            text_color=THEME["accent_cyan"] if mic_available else THEME["text_dim"],
+            command=self._toggle_voice_recording,
+        )
+        self.mic_btn.pack(side="right", padx=(0, 3))
+        if not mic_available:
+            self.mic_btn.configure(state="disabled")
+
+        # 🔊 Voice output toggle
+        self.voice_output_var = ctk.BooleanVar(value=False)
+        self.voice_output_switch = CTkSwitch(
+            input_frame,
+            text="🔊",
+            font=("Consolas", 12),
+            text_color=THEME["accent_cyan"],
+            variable=self.voice_output_var,
+            command=self._toggle_voice_output,
+            onvalue=True,
+            offvalue=False,
+            width=36,
+            progress_color=THEME["accent_magenta"],
+            button_color=THEME["accent_purple"],
+            button_hover_color=THEME["accent_magenta"],
+        )
+        if mic_available:
+            self.voice_output_switch.pack(side="right", padx=(0, 5))
+
+        # Right: Skills Marketplace sidebar
+        self.marketplace_panel = MarketplacePanel(
+            main_frame,
+            skill_manager=self.skill_manager,
+            chat_callback=self._add_system_message,
+            width=340
+        )
+        self.marketplace_panel.pack(side="right", fill="y", padx=(3, 0))
+
+        # Bottom status bar
+        self.status_panel = StatusPanel(self)
+        self.status_panel.pack(fill="x", padx=5, pady=(0, 5))
+
+    # ------------------------------------------
+    # CHAT LOGIC
+    # ------------------------------------------
+
+    # ------------------------------------------
+    # TOOL ARGUMENT DECODING (ported from CLI)
+    # ------------------------------------------
+
+    def _decode_tool_args(self, tool_args: Optional[str]) -> Tuple[List[Any], Dict[str, Any]]:
+        """Decode tool args from protocol text into *args/**kwargs with safe fallbacks."""
+        if tool_args is None:
+            return [], {}
+
+        raw = tool_args.strip()
+        if not raw:
+            return [], {}
+
+        # Accept fenced payloads (```json ...``` / ``` ... ```).
+        fence = re.match(r"^```(?:json|python)?\s*(.*?)\s*```$", raw, re.DOTALL | re.IGNORECASE)
+        if fence:
+            raw = fence.group(1).strip()
+
+        # Accept common wrappers the model may emit.
+        for prefix in ("args=", "args:", "arguments:", "payload:", "input:"):
+            if raw.lower().startswith(prefix):
+                raw = raw[len(prefix):].strip()
+                break
+
+        def _parse_structured(candidate: str) -> Any:
+            """Parse JSON/Python-literal payloads, including nested quoted payloads."""
+            current: Any = candidate
+            for _ in range(3):
+                if not isinstance(current, str):
+                    return current
+                text = current.strip()
+                if not text:
+                    return text
+
+                parsed = None
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    try:
+                        parsed = ast.literal_eval(text)
+                    except Exception:
+                        return text
+
+                # Some model outputs are double-encoded strings; unwrap repeatedly.
+                if isinstance(parsed, str):
+                    if parsed.strip() == text:
+                        return parsed
+                    current = parsed
+                    continue
+
+                return parsed
+            return current
+
+        def _extract_balanced(text: str, open_ch: str, close_ch: str) -> Optional[str]:
+            start = text.find(open_ch)
+            if start < 0:
+                return None
+            depth = 0
+            for i in range(start, len(text)):
+                ch = text[i]
+                if ch == open_ch:
+                    depth += 1
+                elif ch == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return text[start:i + 1]
+            return None
+
+        parsed = _parse_structured(raw)
+        if isinstance(parsed, dict):
+            # Unwrap nested wrapper keys used by some model responses.
+            if len(parsed) == 1:
+                wrapper_key = next(iter(parsed.keys()))
+                if wrapper_key in {"args", "arguments", "payload", "input"}:
+                    inner = _parse_structured(str(parsed[wrapper_key]))
+                    if isinstance(inner, dict):
+                        return [], inner
+                    if isinstance(inner, list):
+                        return inner, {}
+                    if isinstance(inner, str):
+                        raw = inner.strip()
+                    else:
+                        return [inner], {}
+                else:
+                    return [], parsed
+            else:
+                return [], parsed
+        elif isinstance(parsed, list):
+            return parsed, {}
+        elif not isinstance(parsed, str):
+            return [parsed], {}
+        else:
+            raw = parsed.strip()
+
+        # If structured payload is embedded in prose, extract first balanced block.
+        embedded = _extract_balanced(raw, "{", "}") or _extract_balanced(raw, "[", "]")
+        if embedded:
+            parsed_embedded = _parse_structured(embedded)
+            if isinstance(parsed_embedded, dict):
+                return [], parsed_embedded
+            if isinstance(parsed_embedded, list):
+                return parsed_embedded, {}
+            if not isinstance(parsed_embedded, str):
+                return [parsed_embedded], {}
+
+        # Fallback: key=value or key: value lines.
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        kv: Dict[str, Any] = {}
+        if lines:
+            has_explicit_kv = any(re.match(r"^[A-Za-z_]\w*\s*=", ln) for ln in lines) or any(
+                re.match(r"^[A-Za-z_]\w*\s*:\s+.+$", ln) for ln in lines
+            )
+            valid_kv = True
+            if has_explicit_kv:
+                for ln in lines:
+                    if re.match(r"^[A-Za-z_]\w*\s*=", ln):
+                        k, v = ln.split("=", 1)
+                    elif re.match(r"^[A-Za-z_]\w*\s*:\s+.+$", ln):
+                        k, v = ln.split(":", 1)
+                    else:
+                        valid_kv = False
+                        break
+                    k = k.strip()
+                    v = v.strip()
+                    if not k or not re.match(r"^[A-Za-z_]\w*$", k):
+                        valid_kv = False
+                        break
+                    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                        v = v[1:-1]
+                    kv[k] = v
+                if valid_kv and kv:
+                    if len(kv) == 1 and next(iter(kv.keys())) in {"args", "arguments", "payload", "input"}:
+                        inner = _parse_structured(next(iter(kv.values())))
+                        if isinstance(inner, dict):
+                            return [], inner
+                        if isinstance(inner, list):
+                            return inner, {}
+                        if not isinstance(inner, str):
+                            return [inner], {}
+                    return [], kv
+
+        # Legacy fallback: single raw argument string.
+        return [raw], {}
+
+    # ------------------------------------------
+    # CHAT LOGIC
+    # ------------------------------------------
+
+    def _send_message(self):
+        user_input = self.input_entry.get().strip()
+        if not user_input or self.is_processing:
+            return
+
+        self.input_entry.delete(0, "end")
+        self.chat_panel.add_message("user", user_input)
+        self.is_processing = True
+        self.send_btn.configure(state="disabled", text="...")
+        self.status_panel.set_status("Processing...", THEME["warning_color"])
+
+        # Reset tool loop guard state
+        self._last_tool_signature: Optional[str] = None
+        self._last_tool_result: Optional[str] = None
+        self._repeat_tool_hits: int = 0
+        self._tool_error_streak: int = 0
+        self._tool_loop_guard_active: bool = False
+
+        # Add to conversation
+        self.conversation_manager.add_message("user", user_input)
+
+        # Process in background thread
+        threading.Thread(target=self._process_message, args=(user_input,), daemon=True).start()
+
+    def _process_message(self, user_input: str):
+        """Process user message with multi-turn tool execution (up to MAX_ITERATIONS)."""
+        MAX_ITERATIONS = 6
+        
+        self.response_queue.put(("_terminal", f"[START] Processing user message: {user_input[:100]}..."))
+        
+        try:
+            for iteration in range(MAX_ITERATIONS):
+                # Check tool loop guard
+                if self._tool_loop_guard_active:
+                    self.response_queue.put(("_terminal", "[GUARD] Tool loop guard active, forcing final answer"))
+                    self.response_queue.put(("system", "⚠ Tool loop guard active: forcing final answer."))
+                    break
+
+                # Build messages: system prompt + conversation history
+                system_prompt = self.conversation_manager.get_system_prompt()
+
+                # Add active marketplace skills to system prompt
+                if hasattr(self.marketplace_panel, 'marketplace_engine') and self.marketplace_panel.marketplace_engine:
+                    skill_additions = self.marketplace_panel.marketplace_engine.get_active_system_prompt_additions()
+                    if skill_additions:
+                        system_prompt += "\n\n" + skill_additions
+
+                messages: list = [{"role": "system", "content": system_prompt}]
+                messages.extend(self.conversation_manager.to_openai_format())
+
+                # Update status for multi-turn
+                if iteration > 0:
+                    self.response_queue.put(("system", f"--- Turn {iteration + 1} ---"))
+
+                self.response_queue.put(("_terminal", f"[API] Sending request to {CONFIG['MODEL_NAME']} (turn {iteration + 1}/{MAX_ITERATIONS}, {len(messages)} messages)"))
+
+                response = client.chat.completions.create(
+                    model=CONFIG["MODEL_NAME"],
+                    messages=messages,  # type: ignore[arg-type]
+                    temperature=0.1,
+                    max_tokens=16384,
+                )
+
+                assistant_msg = response.choices[0].message.content or ""
+                self.response_queue.put(("_terminal", f"[API] Response received ({len(assistant_msg)} chars)"))
+                self.conversation_manager.add_message("assistant", assistant_msg)
+
+                # Parse for tool calls - returns (text, tool_name, tool_args)
+                text, tool_name, tool_args = self.response_parser.parse(assistant_msg)
+                self.response_queue.put(("_terminal", f"[PARSE] text={len(text or '')} chars, tool={tool_name or 'None'}, args={len(tool_args or '')} chars"))
+
+                # Display the text portion of the response
+                if text:
+                    self.response_queue.put(("assistant", text))
+
+                if tool_name:
+                    available_tools = self.skill_manager.get_active_tools()
+                    self.response_queue.put(("_terminal", f"[TOOL] Calling: {tool_name} | Available: {', '.join(available_tools.keys())}"))
+                    self.response_queue.put(("tool", f"⚡ Executing: {tool_name}"))
+                    
+                    if tool_name in available_tools:
+                        tool_fn = available_tools[tool_name]
+                        
+                        # Decode arguments properly
+                        args, kwargs = self._decode_tool_args(tool_args)
+                        self.response_queue.put(("_terminal", f"[TOOL] Decoded args={args}, kwargs={list(kwargs.keys()) if kwargs else []}"))
+                        
+                        try:
+                            # Try with decoded *args, **kwargs first
+                            result = tool_fn(*args, **kwargs)
+                        except TypeError as te:
+                            self.response_queue.put(("_terminal", f"[TOOL] TypeError, trying raw fallback: {te}"))
+                            # Fallback: some tools expect raw string (backward compat)
+                            if tool_args is not None:
+                                try:
+                                    result = tool_fn(tool_args)
+                                except Exception:
+                                    result = f"💥 Tool argument error: {te}"
+                            else:
+                                result = f"💥 Tool argument error: {te}"
+                        except Exception as e:
+                            result = f"💥 Tool failed: {e}"
+                        
+                        result_str = str(result)[:2500]  # Increased limit for better context
+                        self.response_queue.put(("_terminal", f"[TOOL] Result ({len(result_str)} chars): {result_str[:120]}..."))
+                        self.response_queue.put(("tool", f"Result:\n{result_str}"))
+                        
+                        # Tool loop guard: detect repeated calls with same signature/result
+                        signature = f"{tool_name}|{repr(args)}|{repr(sorted(kwargs.items()) if kwargs else [])}"
+                        if signature == self._last_tool_signature and result_str == self._last_tool_result:
+                            self._repeat_tool_hits += 1
+                        else:
+                            self._repeat_tool_hits = 0
+                        self._last_tool_signature = signature
+                        self._last_tool_result = result_str
+                        
+                        # Track error streak
+                        if result_str.startswith("💥"):
+                            self._tool_error_streak += 1
+                        else:
+                            self._tool_error_streak = 0
+                        
+                        # Activate loop guard if needed
+                        if self._repeat_tool_hits >= 1 or self._tool_error_streak >= 2:
+                            self._tool_loop_guard_active = True
+                            self.conversation_manager.add_message(
+                                "user",
+                                f"RESULT [{tool_name}]: {result_str}\n"
+                                "Stop tool repetition. Provide the best direct answer now, "
+                                "or ask the user for one missing input."
+                            )
+                        else:
+                            # Add tool result to conversation for next iteration
+                            self.conversation_manager.add_message(
+                                "user", f"RESULT [{tool_name}]: {result_str}\nProceed."
+                            )
+                        # Continue to next iteration to let AI process the result
+                        continue
+                    else:
+                        self.response_queue.put(("tool", f"Unknown tool: {tool_name}. Available: {', '.join(available_tools.keys())}"))
+                        # Don't continue loop for unknown tools
+                        break
+                else:
+                    # No tool call - AI gave final response, we're done
+                    if not text:
+                        # If we didn't display text above, display the full message
+                        self.response_queue.put(("assistant", assistant_msg))
+                    break
+
+        except APITimeoutError:
+            self.response_queue.put(("error", f"API Timeout: Server at {CONFIG['API_URL']} is not responding"))
+        except APIError as e:
+            self.response_queue.put(("error", f"API Error: {e}"))
+        except Exception as e:
+            self.response_queue.put(("error", f"Error: {str(e)}"))
+        finally:
+            self.response_queue.put(("_done", ""))
+
+    def _toggle_terminal(self):
+        """Toggle the terminal panel visibility."""
+        self.terminal_enabled = self.terminal_switch_var.get()
+        if self.terminal_enabled:
+            self.terminal_frame.pack(fill="x", padx=0, pady=(4, 0))
+            self._log_terminal("[TERMINAL] Terminal view enabled. AI processing steps will appear here.")
+        else:
+            self.terminal_frame.pack_forget()
+
+    def _log_terminal(self, text: str):
+        """Append a timestamped line to the terminal textbox."""
+        if not self.terminal_enabled or self.terminal_textbox is None:
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self.terminal_textbox.configure(state="normal")
+        self.terminal_textbox.insert("end", f"[{timestamp}] {text}\n")
+        self.terminal_textbox.see("end")
+        self.terminal_textbox.configure(state="disabled")
+
+    def _clear_terminal(self):
+        """Clear the terminal textbox."""
+        if self.terminal_textbox is not None:
+            self.terminal_textbox.configure(state="normal")
+            self.terminal_textbox.delete("1.0", "end")
+            self.terminal_textbox.configure(state="disabled")
+
+    def _poll_responses(self):
+        try:
+            while True:
+                role, content = self.response_queue.get_nowait()
+                if role == "_done":
+                    self.is_processing = False
+                    self.send_btn.configure(state="normal", text="Send")
+                    self.status_panel.set_status("Ready", THEME["accent_cyan"])
+                    self._log_terminal("[DONE] Processing complete.")
+                elif role == "error":
+                    self.chat_panel.add_message("system", content)
+                    self.status_panel.set_status("Error", THEME["error_color"])
+                    self._log_terminal(f"[ERROR] {content}")
+                elif role == "_terminal":
+                    # Terminal-only messages (not shown in chat)
+                    self._log_terminal(content)
+                else:
+                    self.chat_panel.add_message(role, content)
+                    # Speak assistant responses if voice output enabled
+                    if role == "assistant" and self.voice_output_enabled and self.voice_manager:
+                        self._speak_response(content)
+                    # Also log to terminal
+                    short = content[:200].replace("\n", " ")
+                    self._log_terminal(f"[{role.upper()}] {short}")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_responses)
+
+    def _add_system_message(self, role: str, content: str):
+        self.chat_panel.add_message(role, content)
+
+    def _clear_chat(self):
+        self.chat_panel.clear()
+        self.chat_panel.add_message("system", "Chat cleared.")
+
+    def _new_session(self):
+        self.conversation_manager = SamsLawConversationManager(
+            skill_manager=self.skill_manager, use_sam=False
+        )
+        self.chat_panel.clear()
+        self.chat_panel.add_message("system", "New session started.")
+        self.status_panel.set_status("New session", THEME["success_color"])
+
+    # ------------------------------------------
+    # VOICE METHODS
+    # ------------------------------------------
+
+    def _toggle_voice_recording(self):
+        """Toggle voice recording on/off (push-to-talk style)."""
+        if not self.voice_manager:
+            self.chat_panel.add_message("system", "Voice not available. Install: pip install openai-whisper sounddevice numpy edge-tts pygame")
+            return
+
+        if self.is_processing:
+            return
+
+        if not self._voice_recording:
+            # Start recording
+            if not self._voice_initialized:
+                # First time: load Whisper model in background
+                self.mic_btn.configure(text="⏳", fg_color=THEME["warning_color"], text_color="#000000")
+                self.status_panel.set_status("Loading Whisper large model (first time)...", THEME["warning_color"])
+                self.chat_panel.add_message("system", "Loading Whisper large model... This may take a moment on first run (~1.5GB download).")
+
+                def _init_and_record():
+                    success = self.voice_manager.initialize(
+                        progress_callback=lambda msg: self.response_queue.put(("_terminal", f"[VOICE] {msg}"))
+                    )
+                    if success:
+                        self._voice_initialized = True
+                        # Start recording after init
+                        self.after(0, self._start_recording)
+                    else:
+                        self.response_queue.put(("system", "❌ Failed to load Whisper model. Check console for errors."))
+                        self.after(0, lambda: self.mic_btn.configure(
+                            text="🎤", fg_color=THEME["bg_light"], text_color=THEME["accent_cyan"]
+                        ))
+                        self.after(0, lambda: self.status_panel.set_status("Ready", THEME["accent_cyan"]))
+
+                threading.Thread(target=_init_and_record, daemon=True).start()
+                return
+
+            self._start_recording()
+        else:
+            # Stop recording and transcribe
+            self._stop_recording()
+
+    def _start_recording(self):
+        """Start microphone recording."""
+        if not self.voice_manager:
+            return
+        self._voice_recording = True
+        self.mic_btn.configure(text="⏹", fg_color=THEME["error_color"], text_color="#ffffff")
+        self.status_panel.set_status("🎤 Recording... Click mic to stop", THEME["error_color"])
+        self._log_terminal("[VOICE] Recording started")
+
+        if self.voice_manager.start_recording():
+            # Pulse animation
+            self._voice_pulse()
+        else:
+            self._voice_recording = False
+            self.mic_btn.configure(text="🎤", fg_color=THEME["bg_light"], text_color=THEME["accent_cyan"])
+            self.status_panel.set_status("Ready", THEME["accent_cyan"])
+            self.chat_panel.add_message("system", "❌ Failed to start recording. Check microphone.")
+
+    def _stop_recording(self):
+        """Stop recording and transcribe."""
+        if not self.voice_manager:
+            return
+        self._voice_recording = False
+        self.mic_btn.configure(text="⏳", fg_color=THEME["warning_color"], text_color="#000000")
+        self.status_panel.set_status("Transcribing...", THEME["warning_color"])
+        self._log_terminal("[VOICE] Recording stopped, transcribing...")
+
+        def _transcribe():
+            text = self.voice_manager.stop_recording_and_transcribe()
+            if text:
+                self.after(0, lambda: self._on_voice_transcription(text))
+            else:
+                self.after(0, lambda: self.chat_panel.add_message("system", "No speech detected. Try again."))
+            self.after(0, lambda: self.mic_btn.configure(
+                text="🎤", fg_color=THEME["bg_light"], text_color=THEME["accent_cyan"]
+            ))
+            self.after(0, lambda: self.status_panel.set_status("Ready", THEME["accent_cyan"]))
+
+        threading.Thread(target=_transcribe, daemon=True).start()
+
+    def _voice_pulse(self):
+        """Animate the mic button while recording."""
+        if not self._voice_recording:
+            return
+        current = self.mic_btn.cget("fg_color")
+        next_color = THEME["accent_magenta"] if current == THEME["error_color"] else THEME["error_color"]
+        self.mic_btn.configure(fg_color=next_color)
+        self.after(500, self._voice_pulse)
+
+    def _on_voice_state_change(self, state, message: str):
+        """Callback from VoiceManager for state changes."""
+        self._log_terminal(f"[VOICE] State: {state} - {message}")
+
+    def _on_voice_transcription(self, text: str):
+        """Callback when voice transcription is complete — send as chat message."""
+        if not text.strip():
+            return
+        # Insert transcribed text into input and send
+        self.input_entry.delete(0, "end")
+        self.input_entry.insert(0, text)
+        self._send_message()
+
+    def _toggle_voice_output(self):
+        """Toggle TTS voice output for AI responses."""
+        self.voice_output_enabled = self.voice_output_var.get()
+        status = "enabled" if self.voice_output_enabled else "disabled"
+        self._log_terminal(f"[VOICE] Voice output {status}")
+
+    def _speak_response(self, text: str):
+        """Speak AI response using TTS (if voice output enabled)."""
+        if not self.voice_output_enabled or not self.voice_manager:
+            return
+        # Clean text for TTS (remove code blocks, tool calls, etc.)
+        clean = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+        clean = re.sub(r':::.*?:::', '', clean, flags=re.DOTALL)
+        clean = clean.strip()
+        if clean and len(clean) > 5:
+            self.voice_manager.speak(clean, blocking=False)
+
+    # ------------------------------------------
+    # LIVE CALL MODE
+    # ------------------------------------------
+
+    def _toggle_live_call(self):
+        """Toggle live call mode on/off."""
+        if self._live_call_active:
+            self._exit_live_call()
+        else:
+            self._enter_live_call()
+
+    def _enter_live_call(self):
+        """Enter live call mode — hide sidebars/chat, show visualizer + terminal."""
+        if not self.voice_manager:
+            self.chat_panel.add_message("system", "Voice not available for live call.")
+            return
+
+        self._live_call_active = True
+        self.voice_output_enabled = True  # Auto-enable TTS in call mode
+        self.live_call_btn.configure(text="📞 End Call", fg_color=THEME["error_color"],
+                                      hover_color="#cc3333", text_color="#ffffff")
+        self._log_terminal("[LIVE CALL] Entering live call mode")
+
+        # Hide sidebars and chat panel
+        self.file_explorer.pack_forget()
+        self.marketplace_panel.pack_forget()
+        self.chat_panel.pack_forget()
+
+        # Create live call overlay in the chat_terminal_container
+        self._live_call_frame = CTkFrame(self.chat_terminal_container, fg_color=THEME["bg_dark"], corner_radius=10)
+        self._live_call_frame.pack(fill="both", expand=True)
+
+        # Visualizer (fills most of the space)
+        self._live_call_visualizer = CircularAudioVisualizer(self._live_call_frame)
+        self._live_call_visualizer.pack(fill="both", expand=True, padx=10, pady=(10, 5))
+        self._live_call_visualizer.set_state("idle", "Ready to listen...")
+        self._live_call_visualizer.start_animation()
+
+        # Call controls bar at bottom of visualizer
+        call_controls = CTkFrame(self._live_call_frame, fg_color=THEME["bg_medium"], corner_radius=8)
+        call_controls.pack(fill="x", padx=10, pady=(5, 10))
+
+        # Large mic button
+        self._live_call_mic_btn = CTkButton(
+            call_controls, text="🎤 Talk", width=120, height=44,
+            font=("Consolas", 14, "bold"),
+            fg_color=THEME["accent_cyan"], hover_color=THEME["accent_magenta"],
+            text_color="#000000",
+            command=self._live_call_toggle_mic,
+        )
+        self._live_call_mic_btn.pack(side="left", padx=15, pady=10)
+
+        # End call button
+        CTkButton(
+            call_controls, text="📞 End Call", width=100, height=44,
+            font=("Consolas", 12, "bold"),
+            fg_color=THEME["error_color"], hover_color="#cc3333",
+            text_color="#ffffff",
+            command=self._exit_live_call,
+        ).pack(side="right", padx=15, pady=10)
+
+        # Call status label
+        self._live_call_status = CTkLabel(
+            call_controls, text="LIVE CALL — Click 🎤 to speak",
+            font=("Consolas", 11), text_color=THEME["accent_cyan"]
+        )
+        self._live_call_status.pack(side="left", fill="x", expand=True, padx=10)
+
+        # Enable terminal if not already
+        if not self.terminal_enabled:
+            self.terminal_switch_var.set(True)
+            self._toggle_terminal()
+
+        # Initialize voice if needed
+        if not self._voice_initialized:
+            self._live_call_visualizer.set_state("processing", "Loading Whisper model...")
+            self._live_call_status.configure(text="Loading Whisper large model...")
+
+            def _init_voice():
+                success = self.voice_manager.initialize(
+                    progress_callback=lambda msg: self.response_queue.put(("_terminal", f"[VOICE] {msg}"))
+                )
+                if success:
+                    self._voice_initialized = True
+                    self.after(0, lambda: self._live_call_visualizer.set_state("idle", "Ready to listen...") if self._live_call_visualizer else None)
+                    self.after(0, lambda: self._live_call_status.configure(text="LIVE CALL — Click 🎤 to speak") if hasattr(self, '_live_call_status') else None)
+                else:
+                    self.after(0, lambda: self._live_call_visualizer.set_state("idle", "Model load failed") if self._live_call_visualizer else None)
+                    self.response_queue.put(("system", "❌ Failed to load Whisper model."))
+
+            threading.Thread(target=_init_voice, daemon=True).start()
+
+        self.status_panel.set_status("📞 LIVE CALL MODE", THEME["success_color"])
+
+    def _exit_live_call(self):
+        """Exit live call mode — restore normal GUI."""
+        self._live_call_active = False
+        self._log_terminal("[LIVE CALL] Exiting live call mode")
+
+        # Stop any ongoing recording
+        if self._voice_recording and self.voice_manager:
+            self._voice_recording = False
+            try:
+                self.voice_manager.stop_recording_and_transcribe()  # discard
+            except Exception:
+                pass
+
+        # Stop visualizer
+        if self._live_call_visualizer:
+            self._live_call_visualizer.stop_animation()
+            self._live_call_visualizer = None
+
+        # Destroy live call frame
+        if self._live_call_frame:
+            self._live_call_frame.destroy()
+            self._live_call_frame = None
+
+        self._live_call_mic_btn = None
+
+        # Restore normal layout
+        self.chat_panel.pack(fill="both", expand=True)
+        """Insert a file path into the chat input (callback from FileExplorer)."""
+        current = self.input_entry.get()
+        if current:
+            self.input_entry.delete(0, "end")
+            self.input_entry.insert(0, f"{current} {path}")
+        else:
+            self.input_entry.insert(0, path)
+        self.input_entry.focus()
+
+
+# ==========================================
+# ENTRY POINT
+# ==========================================
+
+def main():
+    app = TripleGGUI()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
